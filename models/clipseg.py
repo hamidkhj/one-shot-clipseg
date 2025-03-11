@@ -114,6 +114,7 @@ class CLIPDenseBase(nn.Module):
             self.precomputed_prompts = {k: torch.from_numpy(v) for k, v in precomp.items()}        
         else:
             self.precomputed_prompts = dict()
+
     
     def rescaled_pos_emb(self, new_size):
         assert len(new_size) == 2
@@ -125,7 +126,7 @@ class CLIPDenseBase(nn.Module):
     def visual_forward(self, x_inp, extract_layers=(), skip=False, mask=None):
         
 
-        with torch.no_grad():
+        with torch.set_grad_enabled(True):
 
             inp_size = x_inp.shape[2:]
 
@@ -222,6 +223,7 @@ class CLIPDenseBase(nn.Module):
             raise ValueError('invalid conditional')
         return cond   
 
+        
     def compute_conditional(self, conditional):
         import clip
 
@@ -237,6 +239,7 @@ class CLIPDenseBase(nn.Module):
                 text_tokens = clip.tokenize([conditional]).to(dev)
                 cond = self.clip_model.encode_text(text_tokens)[0]
         
+        # print('cond shape: ', cond.shape) # [b, 512]
         if self.shift_vector is not None:
             return cond + self.shift_vector
         else:
@@ -342,68 +345,164 @@ class CLIPDensePredT(CLIPDenseBase):
 
         self.prompt_list = get_prompt_list(prompt)
 
+        ##########################################################
 
-    def forward(self, inp_image, conditional=None, return_features=False, mask=None):
 
+        
+        ##########################################################
+
+
+    def forward(self, inp_image, emb_to_learn, conditional=None, return_features=False, mask=None, is_training=True):
         assert type(return_features) == bool
-
+        
         inp_image = inp_image.to(self.model.positional_embedding.device)
-
+        
         if mask is not None:
             raise ValueError('mask not supported')
-
-        # x_inp = normalize(inp_image)
+        
         x_inp = inp_image
-
+        
         bs, dev = inp_image.shape[0], x_inp.device
+        
+        # # Register hook early for better debugging
+        # def grad_hook(grad):
+        #     print("emb_to_learn grad in forward:", grad is not None)
+        #     if grad is not None:
+        #         print("grad stats:", grad.min().item(), grad.mean().item(), grad.max().item())
+        # emb_to_learn.register_hook(grad_hook)
 
-        cond = self.get_cond_vec(conditional, bs)
 
+        # Preserve the original embedding
+        # embedding = emb_to_learn  # Keep a reference to the original parameter
+        
         visual_q, activations, _ = self.visual_forward(x_inp, extract_layers=[0] + list(self.extract_layers))
-
+        
         activation1 = activations[0]
         activations = activations[1:]
-
+        
         _activations = activations[::-1] if not self.rev_activations else activations
-
+        
         a = None
         for i, (activation, block, reduce) in enumerate(zip(_activations, self.blocks, self.reduces)):
-            
             if a is not None:
                 a = reduce(activation) + a
             else:
                 a = reduce(activation)
-
+            
             if i == self.cond_layer:
+                # cur_embedding = emb_to_learn  # Use the reference
                 if self.reduce_cond is not None:
-                    cond = self.reduce_cond(cond)
+                    emb_to_learn = self.reduce_cond(emb_to_learn)
                 
-                a = self.film_mul(cond) * a + self.film_add(cond)
-
+                # Apply FiLM conditioning
+                a = self.film_mul(emb_to_learn) * a + self.film_add(emb_to_learn)
+                # film_output = self.film_mul(emb_to_learn) * a + self.film_add(emb_to_learn)
+                # if is_training:
+                #     film_output.retain_grad()  # Make sure this intermediate value retains its gradient
+                # a = film_output
+            
             a = block(a)
 
+        
+        # print("Film Mul grad_fn:", self.film_mul(emb_to_learn).grad_fn)
+        # print("Film Add grad_fn:", self.film_add(emb_to_learn).grad_fn)
+        
         for block in self.extra_blocks:
             a = a + block(a)
-
-        a = a[1:].permute(1, 2, 0) # rm cls token and -> BS, Feats, Tokens
-
+        
+        a = a[1:].permute(1, 2, 0)  # rm cls token and -> BS, Feats, Tokens
+        
         size = int(math.sqrt(a.shape[2]))
-
+        
         a = a.view(bs, a.shape[1], size, size)
-
+        
         a = self.trans_conv(a)
-
+        
         if self.n_tokens is not None:
             a = nnf.interpolate(a, x_inp.shape[2:], mode='bilinear', align_corners=True) 
-
+        
         if self.upsample_proj is not None:
             a = self.upsample_proj(a)
             a = nnf.interpolate(a, x_inp.shape[2:], mode='bilinear')
 
+        # # Register hook early for better debugging
+        # def grad_hook(grad):
+        #     print("emb_to_learn grad in forward:", grad is not None)
+        #     if grad is not None:
+        #         print("grad stats:", grad.min().item(), grad.mean().item(), grad.max().item())
+        # emb_to_learn.register_hook(grad_hook)
+
+        a = a + 0.0001 * emb_to_learn.mean()
+        
         if return_features:
-            return a, visual_q, cond, [activation1] + activations
+            return a, visual_q, emb_to_learn, [activation1] + activations
         else:
-            return a,
+            return a, 
+    # def forward(self, inp_image,emb_to_learn, conditional=None, return_features=False, mask=None ):
+
+    #     assert type(return_features) == bool
+
+    #     inp_image = inp_image.to(self.model.positional_embedding.device)
+
+    #     if mask is not None:
+    #         raise ValueError('mask not supported')
+
+    #     # x_inp = normalize(inp_image)
+    #     x_inp = inp_image
+
+    #     bs, dev = inp_image.shape[0], x_inp.device
+
+    #     # cond = self.get_cond_vec(emb_to_learn, bs)
+    #     cond = emb_to_learn
+    #     # def grad_hook(grad):
+    #     #     print("cond grad:", grad is not None)
+    #     # cond.register_hook(grad_hook)
+
+    #     visual_q, activations, _ = self.visual_forward(x_inp, extract_layers=[0] + list(self.extract_layers))
+
+    #     activation1 = activations[0]
+    #     activations = activations[1:]
+
+    #     _activations = activations[::-1] if not self.rev_activations else activations
+
+    #     a = None
+    #     for i, (activation, block, reduce) in enumerate(zip(_activations, self.blocks, self.reduces)):
+            
+    #         if a is not None:
+    #             a = reduce(activation) + a
+    #         else:
+    #             a = reduce(activation)
+
+    #         if i == self.cond_layer:
+    #             if self.reduce_cond is not None:
+    #                 cond = self.reduce_cond(cond)
+                
+    #             a = self.film_mul(cond) * a + self.film_add(cond)
+
+    #         a = block(a)
+
+    #     for block in self.extra_blocks:
+    #         a = a + block(a)
+
+    #     a = a[1:].permute(1, 2, 0) # rm cls token and -> BS, Feats, Tokens
+
+    #     size = int(math.sqrt(a.shape[2]))
+
+    #     a = a.view(bs, a.shape[1], size, size)
+
+    #     a = self.trans_conv(a)
+
+    #     if self.n_tokens is not None:
+    #         a = nnf.interpolate(a, x_inp.shape[2:], mode='bilinear', align_corners=True) 
+
+    #     if self.upsample_proj is not None:
+    #         a = self.upsample_proj(a)
+    #         a = nnf.interpolate(a, x_inp.shape[2:], mode='bilinear')
+
+    #     if return_features:
+    #         return a, visual_q, cond, [activation1] + activations
+    #     else:
+    #         return a,
 
 
 
