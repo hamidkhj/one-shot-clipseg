@@ -135,3 +135,8 @@ dmypy.json
 clipseg_weights/
 datasets/
 outputs/
+results/
+comparison_results/
+validations/
+
+*.pt
