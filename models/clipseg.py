@@ -432,7 +432,8 @@ class CLIPDensePredT(CLIPDenseBase):
         #         print("grad stats:", grad.min().item(), grad.mean().item(), grad.max().item())
         # emb_to_learn.register_hook(grad_hook)
 
-        a = a + 0.0001 * emb_to_learn.mean()
+        ##skip connection
+        # a = a + 0.0001 * emb_to_learn.mean()
         
         if return_features:
             return a, visual_q, emb_to_learn, [activation1] + activations
